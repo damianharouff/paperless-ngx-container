@@ -1,0 +1,24 @@
+# Secrets and runtime config
+paperless.env
+
+# Container-managed state
+state/
+
+# Paperless drop / export folders
+consume/
+export/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code local config
+.claude/settings.local.json
