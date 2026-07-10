@@ -1,5 +1,7 @@
 # Notes for future Claude sessions
 
+**This is a PUBLIC repo. Never commit identifying details**: tailnet names, ts.net hostnames, machine/node names, public or LAN IPs, MAC addresses, emails. Use placeholders like `<mac-node-name>.<tailnet>.ts.net` or "the LAN gateway" in docs. (Absolute `/Users/damian/...` paths in the launchd plists are functionally required and acceptable.) Before any commit touching docs, grep the diff for `ts\.net|@|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+` and genericize non-RFC1918/non-container addresses.
+
 This project orchestrates [paperless-ngx](https://github.com/paperless-ngx/paperless-ngx) under Apple's [`container`](https://github.com/apple/container) CLI on macOS 26+. Everything is driven by `paperless.sh`; there's no docker-compose because `container` doesn't support it.
 
 ## What's in the script that you'd never guess from `container --help`
@@ -16,7 +18,7 @@ These are behavioral quirks of `container` discovered empirically — originally
 
 ## Environmental conflict — root-caused, handled by a LaunchDaemon (2026-07-09)
 
-The user runs **Tailscale with an exit node**. The culprit is the client's **"Allow local network access"** setting (`ExitNodeAllowLANAccess`): on macOS it installs a gateway route for *every* RFC1918 connected subnet toward the LAN gateway (`10.64/24 → 192.168.50.1 via en0`), clobbering `bridge100`'s connected route. That breaks both host→container (`--publish`, direct IP) and container→internet (NAT return path). Known open Tailscale bug — also bites OrbStack (orbstack/orbstack#2297); there is no per-subnet exclusion knob.
+The user runs **Tailscale with an exit node**. The culprit is the client's **"Allow local network access"** setting (`ExitNodeAllowLANAccess`): on macOS it installs a gateway route for *every* RFC1918 connected subnet toward the LAN gateway (`10.64/24 → <lan-gateway> via en0`), clobbering `bridge100`'s connected route. That breaks both host→container (`--publish`, direct IP) and container→internet (NAT return path). Known open Tailscale bug — also bites OrbStack (orbstack/orbstack#2297); there is no per-subnet exclusion knob.
 
 **Don't suggest turning the setting off** — tested that; containers work and the router stays reachable via the scoped route, but the user's **printer breaks**, so the toggle must stay ON.
 
