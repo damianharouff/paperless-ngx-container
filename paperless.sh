@@ -66,11 +66,46 @@ preflight() {
     die "macOS 26+ required (inter-container DNS doesn't work on 15). Got $(sw_vers -productVersion)."
   fi
 
+  # The service reads ~/.config/container/config.toml once at startup, so the
+  # config has to exist before the first start. dns.domain used to be a
+  # `container system property`, but 1.0 removed the get/set subcommands in
+  # favor of this file.
+  ensure_config
+
   # System service must be running for network/run commands.
   container system status >/dev/null 2>&1 || {
     log "starting container system service"
     container system start
   }
+
+  # On a pristine install `container system start` prompts for a kernel and
+  # hangs without a tty; install the recommended one non-interactively.
+  if ! container system property list 2>/dev/null | grep -q 'binaryPath'; then
+    log "installing recommended kernel"
+    container system kernel set --recommended
+  fi
+}
+
+CONFIG_TOML="$HOME/.config/container/config.toml"
+
+ensure_config() {
+  if [[ ! -f "$CONFIG_TOML" ]]; then
+    log "writing $CONFIG_TOML (dns domain + subnet)"
+    mkdir -p "$(dirname "$CONFIG_TOML")"
+    printf '[dns]\ndomain = "%s"\n\n[network]\nsubnet = "%s"\n' \
+      "$DNS_DOMAIN" "$CONTAINER_SUBNET" > "$CONFIG_TOML"
+    # If the service is already up it started with the old config; bounce it.
+    if container system status >/dev/null 2>&1; then
+      log "restarting container system service to pick up config"
+      container system stop
+      container system start
+    fi
+    return
+  fi
+  grep -q "domain = \"$DNS_DOMAIN\"" "$CONFIG_TOML" \
+    || warn "$CONFIG_TOML lacks [dns] domain = \"$DNS_DOMAIN\" — bare service names won't resolve until you add it and restart with 'container system stop && container system start'"
+  grep -q "subnet = \"$CONTAINER_SUBNET\"" "$CONFIG_TOML" \
+    || warn "$CONFIG_TOML lacks [network] subnet = \"$CONTAINER_SUBNET\" — update it or CONTAINER_SUBNET in this script so they agree. NOTE: vmnet only accepts RFC1918 subnets; non-private ranges hang 'container system start'."
 }
 
 ensure_env() {
@@ -102,8 +137,12 @@ ensure_network() {
 
 ensure_route() {
   # If the host's route to the container subnet doesn't land on bridge100,
-  # something else (VPN split-tunnel rules, leftover DHCP routes) is hijacking
-  # it. Replace with an interface route via the bridge so --publish works.
+  # something is hijacking it. Known culprit: Tailscale's "Allow local network
+  # access" (exit-node setting) installs a gateway route for every RFC1918
+  # subnet — including this one — toward the LAN gateway, breaking --publish
+  # AND container outbound internet. The durable fix is turning that setting
+  # off (LAN stays reachable via the en0 scoped route); this function is just
+  # a safety net that patches the route until the next clobber.
   local iface
   iface=$(route -n get -net "$CONTAINER_SUBNET" 2>/dev/null | awk '/interface:/ {print $2}')
   if [[ "$iface" == "$CONTAINER_BRIDGE" ]]; then
@@ -125,20 +164,20 @@ ensure_route() {
 }
 
 ensure_dns() {
-  # apple/container doesn't auto-resolve bare service names. Three things are
-  # needed: (1) register the domain (creates /etc/resolver entry + an internal
-  # DNS server on 127.0.0.1:2053), (2) set dns.domain as the system default so
-  # the runtime registers each new container into the domain automatically,
-  # (3) pass --dns-search on `container run` so containers resolve bare names.
+  # apple/container doesn't auto-resolve bare service names. Two things are
+  # needed: (1) register the domain — one-time, needs admin, creates an
+  # /etc/resolver entry + name records, survives reboots; (2) the [dns]
+  # domain in config.toml (see ensure_config) so each container's
+  # resolv.conf gets the search domain automatically.
   if ! container system dns list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$DNS_DOMAIN"; then
-    log "registering DNS domain $DNS_DOMAIN (needs sudo)"
-    sudo container system dns create "$DNS_DOMAIN"
-  fi
-  local current
-  current=$(container system property get dns.domain 2>/dev/null || true)
-  if [[ "$current" != "$DNS_DOMAIN" ]]; then
-    log "setting dns.domain=$DNS_DOMAIN"
-    container system property set dns.domain "$DNS_DOMAIN"
+    log "registering DNS domain $DNS_DOMAIN (one-time, needs admin)"
+    if [[ -t 0 ]]; then
+      sudo container system dns create "$DNS_DOMAIN"
+    else
+      # No tty for a sudo password prompt — fall back to the GUI dialog.
+      osascript -e "do shell script \"$(command -v container) system dns create $DNS_DOMAIN\" with administrator privileges" >/dev/null \
+        || die "couldn't register $DNS_DOMAIN — run: sudo container system dns create $DNS_DOMAIN"
+    fi
   fi
 }
 
@@ -203,7 +242,12 @@ start_webserver() {
   (( WITH_GOTENBERG )) && extra_env+=(
     --env PAPERLESS_TIKA_GOTENBERG_ENDPOINT=http://gotenberg:3000
   )
+  # apple/container defaults every container to 1 GB. The paperless image
+  # runs gunicorn + celery + consumer in this one container and idles near
+  # that cap — one-off manage.py commands (document_importer et al) then get
+  # OOM-killed. 2 GB is the paperless-ngx recommended minimum.
   start_one webserver \
+    --memory 2g \
     --env-file "$ENV_FILE" \
     "${extra_env[@]}" \
     --publish 8000:8000 \
@@ -231,17 +275,17 @@ start_tailscale() {
   authkey=$(grep -E '^TS_AUTHKEY=.+' "$ENV_FILE" | cut -d= -f2-)
   [[ -n "$authkey" ]] \
     || die "TS_AUTHKEY is empty in $ENV_FILE — get one at https://login.tailscale.com/admin/settings/keys and set it before --with-tailscale"
-  # State intentionally lives inside the container's writable layer rather
-  # than a bind mount: apple/container's virtiofs rejects the chmod 0700 that
-  # tailscaled does on its state dir, so tailscaled falls back to in-memory
-  # state and refuses to start. With a reusable TS_AUTHKEY the node simply
-  # re-registers on each recreate. The serve.json bind is read-only, no
-  # chmod, so it's safe.
+  # State persists via bind mount since container 1.1.0: virtiofs used to
+  # reject chmod entirely (forcing ephemeral state + TS_AUTHKEY re-auth on
+  # every recreate); now chmod works INSIDE a mount but still fails on the
+  # mount root itself. tailscaled chmods its state dir, so TS_STATE_DIR must
+  # be a subdirectory of the mount, not the mount point.
   start_one tailscale \
     --env-file "$ENV_FILE" \
     --env TS_USERSPACE=true \
-    --env TS_STATE_DIR=/var/lib/tailscale \
+    --env TS_STATE_DIR=/var/lib/tailscale/data \
     --env TS_SERVE_CONFIG=/config/serve.json \
+    --volume "$TAILSCALE_STATE:/var/lib/tailscale" \
     --volume "$TAILSCALE_SERVE_JSON:/config/serve.json" \
     "$TAILSCALE_IMAGE"
 }
@@ -266,10 +310,6 @@ cmd_up() {
   ensure_dirs
   ensure_network
   ensure_dns
-  # Only worry about the kernel-route hack if the user actually needs the
-  # host-loopback --publish path. With --with-tailscale they reach paperless
-  # over the tailnet, where bridge routing is irrelevant.
-  (( WITH_TAILSCALE )) || ensure_route
 
   start_broker
   start_db
@@ -278,6 +318,13 @@ cmd_up() {
   (( WITH_GOTENBERG )) && start_gotenberg
   start_webserver
   (( WITH_TAILSCALE )) && start_tailscale
+
+  # Route check runs AFTER containers exist: bridge100 and its connected
+  # route only materialize once something is running, so checking earlier
+  # false-positives on a fresh boot. Containers need outbound internet even
+  # when the user only reaches paperless over the tailnet, so don't skip
+  # this for --with-tailscale.
+  ensure_route
 
   if (( WITH_TAILSCALE )); then
     local hostname
