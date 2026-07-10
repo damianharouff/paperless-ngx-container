@@ -54,12 +54,14 @@ Access:
 
 | Container | Image | Purpose |
 |---|---|---|
-| `broker` | `redis:8` | Celery message bus |
-| `db` | `postgres:18` | App database |
-| `tika` (opt) | `apache/tika:latest` | Office document text extraction |
-| `gotenberg` (opt) | `gotenberg/gotenberg:8` | PDF generation (Chromium + LibreOffice) |
-| `webserver` | `paperless-ngx:latest` | Django + Granian, port 8000 |
-| `tailscale` (opt) | `tailscale/tailscale:latest` | Userspace WireGuard, HTTPS proxy to webserver |
+| `paperless-broker` | `redis:8` | Celery message bus |
+| `paperless-db` | `postgres:18` | App database |
+| `paperless-tika` (opt) | `apache/tika:latest` | Office document text extraction |
+| `paperless-gotenberg` (opt) | `gotenberg/gotenberg:8` | PDF generation (Chromium + LibreOffice) |
+| `paperless-webserver` | `paperless-ngx:latest` | Django + Granian, port 8000 |
+| `paperless-tailscale` (opt) | `tailscale/tailscale:latest` | Userspace WireGuard, HTTPS proxy to webserver |
+
+Container names are prefixed `paperless-` so the stack coexists with other containers on the system. Script commands accept short names: `./paperless.sh logs db` follows `paperless-db`.
 
 All images are pulled natively for `linux/arm64`. No Rosetta needed.
 

@@ -17,6 +17,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # share the default network and rely on the DNS domain for service discovery.
 NETWORK="default"
 DNS_DOMAIN="paperless.local"
+# Container names are prefixed so this stack coexists with other containers
+# on the system. The prefix is part of each service's DNS name — paperless.env
+# and tailscale-serve.json must reference paperless-db, paperless-broker, etc.
+SVC_PREFIX="paperless-"
 # Default subnet (192.168.64.0/24) collides with split-tunnel exceptions some
 # VPNs (e.g. Tailscale exit nodes) push for RFC1918 ranges, which sends host→
 # container traffic out the wifi gateway. Move to a less-trafficked /24 and,
@@ -183,6 +187,15 @@ ensure_dns() {
 
 # --- container helpers ------------------------------------------------------
 
+# Map a short service name (db, webserver) to its container name. Already-
+# prefixed names pass through, so `exec paperless-db` works too.
+svc_name() {
+  case "$1" in
+    "$SVC_PREFIX"*) printf '%s\n' "$1" ;;
+    *)              printf '%s%s\n' "$SVC_PREFIX" "$1" ;;
+  esac
+}
+
 exists() { container list --all --format json 2>/dev/null | grep -q "\"$1\""; }
 
 start_one() {
@@ -205,18 +218,18 @@ start_one() {
 wait_for_db() {
   log "waiting for postgres to accept connections"
   for _ in $(seq 1 60); do
-    if container exec db pg_isready -U paperless >/dev/null 2>&1; then
+    if container exec "$(svc_name db)" pg_isready -U paperless >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
   done
-  die "postgres didn't come up within 60s — check 'container logs db'"
+  die "postgres didn't come up within 60s — check 'container logs $(svc_name db)'"
 }
 
 # --- service definitions ----------------------------------------------------
 
 start_broker() {
-  start_one broker \
+  start_one "$(svc_name broker)" \
     --volume "$REDISDATA:/data" \
     "$REDIS_IMAGE"
 }
@@ -225,7 +238,7 @@ start_db() {
   # Postgres 18 image expects the volume at /var/lib/postgresql (the parent),
   # not /var/lib/postgresql/data — it places versioned subdirs inside so
   # pg_upgrade --link works cleanly. See docker-library/postgres#1259.
-  start_one db \
+  start_one "$(svc_name db)" \
     --env-file "$ENV_FILE" \
     --volume "$PGDATA:/var/lib/postgresql" \
     "$DB_IMAGE"
@@ -237,16 +250,16 @@ start_webserver() {
   local extra_env=()
   (( WITH_TIKA )) && extra_env+=(
     --env PAPERLESS_TIKA_ENABLED=1
-    --env PAPERLESS_TIKA_ENDPOINT=http://tika:9998
+    --env "PAPERLESS_TIKA_ENDPOINT=http://$(svc_name tika):9998"
   )
   (( WITH_GOTENBERG )) && extra_env+=(
-    --env PAPERLESS_TIKA_GOTENBERG_ENDPOINT=http://gotenberg:3000
+    --env "PAPERLESS_TIKA_GOTENBERG_ENDPOINT=http://$(svc_name gotenberg):3000"
   )
   # apple/container defaults every container to 1 GB. The paperless image
   # runs gunicorn + celery + consumer in this one container and idles near
   # that cap — one-off manage.py commands (document_importer et al) then get
   # OOM-killed. 2 GB is the paperless-ngx recommended minimum.
-  start_one webserver \
+  start_one "$(svc_name webserver)" \
     --memory 2g \
     --env-file "$ENV_FILE" \
     "${extra_env[@]}" \
@@ -258,12 +271,12 @@ start_webserver() {
     "$WEB_IMAGE"
 }
 
-start_tika()      { start_one tika      "$TIKA_IMAGE"; }
+start_tika()      { start_one "$(svc_name tika)"      "$TIKA_IMAGE"; }
 # Unlike Docker, apple/container's `run <image> <args...>` replaces the whole
 # ENTRYPOINT — so passing extra gotenberg flags here means we'd have to
 # re-state the entrypoint binary. The defaults work fine; revisit only if
 # the Chromium sandbox actually breaks in the microVM.
-start_gotenberg() { start_one gotenberg "$GOTENBERG_IMAGE"; }
+start_gotenberg() { start_one "$(svc_name gotenberg)" "$GOTENBERG_IMAGE"; }
 
 # Sidecar that joins our tailnet and HTTPS-proxies it to the webserver. Runs
 # in userspace mode (TS_USERSPACE=true) so it doesn't need /dev/net/tun or
@@ -280,7 +293,7 @@ start_tailscale() {
   # every recreate); now chmod works INSIDE a mount but still fails on the
   # mount root itself. tailscaled chmods its state dir, so TS_STATE_DIR must
   # be a subdirectory of the mount, not the mount point.
-  start_one tailscale \
+  start_one "$(svc_name tailscale)" \
     --env-file "$ENV_FILE" \
     --env TS_USERSPACE=true \
     --env TS_STATE_DIR=/var/lib/tailscale/data \
@@ -338,11 +351,13 @@ cmd_up() {
 }
 
 cmd_down() {
+  local name
   for svc in tailscale webserver gotenberg tika db broker; do
-    if exists "$svc"; then
-      log "stopping $svc"
-      container stop "$svc" >/dev/null 2>&1 || true
-      container rm   "$svc" >/dev/null 2>&1 || true
+    name="$(svc_name "$svc")"
+    if exists "$name"; then
+      log "stopping $name"
+      container stop "$name" >/dev/null 2>&1 || true
+      container rm   "$name" >/dev/null 2>&1 || true
     fi
   done
 }
@@ -351,17 +366,17 @@ cmd_status() { container list --all; }
 
 cmd_logs() {
   local svc="${1:-webserver}"
-  container logs --follow "$svc"
+  container logs --follow "$(svc_name "$svc")"
 }
 
 cmd_exec() {
   local svc="${1:-webserver}"; shift || true
   [[ $# -gt 0 ]] || die "usage: $0 exec [service] <cmd...>"
-  container exec --interactive --tty "$svc" "$@"
+  container exec --interactive --tty "$(svc_name "$svc")" "$@"
 }
 
 cmd_createsuperuser() {
-  container exec --interactive --tty webserver python manage.py createsuperuser
+  container exec --interactive --tty "$(svc_name webserver)" python manage.py createsuperuser
 }
 
 # --- dispatch ---------------------------------------------------------------
