@@ -10,7 +10,6 @@
 		<string>up</string>
 		<string>--with-tika</string>
 		<string>--with-gotenberg</string>
-		<string>--with-tailscale</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>/Users/damian/code/paperless-ngx-container</string>
