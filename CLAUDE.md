@@ -34,7 +34,8 @@ Re-pin events log to syslog (`logger -t paperless-route`) and `/var/log/paperles
 ## Tailscale sidecar caveats
 
 - **State persists** in `state/tailscale/data` via bind mount (verified working 2026-07-09; note the `TS_STATE_DIR` subdirectory nuance in point #6). A reusable `TS_AUTHKEY` is still good practice but no longer burns on every recreate. `PAPERLESS_URL` in `paperless.env` is set to the ts.net URL for CSRF; if localhost login ever throws CSRF errors, add `PAPERLESS_CSRF_TRUSTED_ORIGINS=http://localhost:8000`.
-- The sidecar runs in **userspace mode** (`TS_USERSPACE=true`) because it doesn't have `/dev/net/tun` or NET_ADMIN. `tailscale serve` works fine in userspace mode — HTTPS termination + reverse proxy to `http://webserver:8000`.
+- The sidecar runs in **userspace mode** (`TS_USERSPACE=true`) because it doesn't have `/dev/net/tun` or NET_ADMIN. `tailscale serve` works in userspace mode — HTTPS termination + reverse proxy to `http://webserver:8000` — **but is catastrophically slow** as of tailscale 1.98.8: gVisor netstack's Nagle + client delayed-ACK interaction (tailscale/tailscale#18916, open) stalls ~200ms per few KB. Measured: ~450ms per TLS handshake, 232KB asset in 14s (~17KB/s). Applies equally to HTTPS proxy, HTTP proxy, and TCPForward — don't bother retuning serve.json; the bug is below that layer. Re-test with a newer tailscale image when the issue closes.
+- **The fast path (2026-07-09): host-side `tailscale serve` on the Mac's native client** — `/Applications/Tailscale.app/Contents/MacOS/Tailscale serve --bg 8000` → `https://<mac-node-name>.<tailnet>.ts.net` at ~60ms/connection, ~6MB/s (native kernel TCP, no netstack). Config persists in the client across reboots. `PAPERLESS_URL` points at this hostname; the sidecar URL stays as a slow fallback and its origin is in `PAPERLESS_CSRF_TRUSTED_ORIGINS`.
 
 ## Login-time start of the stack — DONE (2026-07-09)
 
